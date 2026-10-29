@@ -4,6 +4,12 @@ Terminal browser for your [Claude Code](https://claude.com/claude-code) conversa
 
 Single Python file, standard library only (curses). No dependencies.
 
+![Conversation list](docs/list.png)
+
+![Conversation viewer](docs/view.png)
+
+*(Screenshots use sample conversations.)*
+
 ## Install
 
 ```bash
