@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""claude-sessions: terminal browser for Claude Code conversations.
+
+Lists the sessions in ~/.claude/projects, shows their content, restores
+them (claude --resume) and deletes them. Standard library only (curses).
+"""
+import curses
+import json
+import os
+import shutil
+import sys
+import textwrap
+from datetime import datetime
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+ROOT = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
+
+
+def text_of(content):
+    """Extract only the readable text from a message content."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for b in content or []:
+        if isinstance(b, dict) and b.get("type") == "text":
+            parts.append(b.get("text", ""))
+    return "\n".join(parts)
+
+
+def read_messages(path):
+    """Return [(role, text)], skipping tool_result, sidechains and system reminders."""
+    msgs = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                t = d.get("type")
+                if t not in ("user", "assistant") or d.get("isSidechain") or d.get("isMeta"):
+                    continue
+                txt = text_of((d.get("message") or {}).get("content")).strip()
+                if not txt or txt.startswith("<system-reminder>"):
+                    continue
+                msgs.append((t, txt))
+    except OSError:
+        pass
+    return msgs
+
+
+def load_session(path):
+    title = custom = cwd = None
+    first = None
+    n = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                t = d.get("type")
+                if t == "ai-title":
+                    title = d.get("aiTitle") or title
+                elif t == "custom-title":
+                    custom = d.get("customTitle") or custom
+                if cwd is None and d.get("cwd"):
+                    cwd = d["cwd"]
+                if t in ("user", "assistant") and not d.get("isSidechain") and not d.get("isMeta"):
+                    txt = text_of((d.get("message") or {}).get("content")).strip()
+                    if txt and not txt.startswith("<system-reminder>"):
+                        n += 1
+                        if t == "user" and first is None:
+                            first = txt
+    except OSError:
+        return None
+    if n == 0:
+        return None
+    title = custom or title or (first or "(untitled)").replace("\n", " ")
+    st = path.stat()
+    return {
+        "id": path.stem,
+        "path": path,
+        "title": title,
+        "cwd": cwd or "",
+        "n": n,
+        "mtime": st.st_mtime,
+        "size": st.st_size,
+    }
+
+
+def list_sessions():
+    sessions = []
+    for p in ROOT.glob("*/*.jsonl"):
+        s = load_session(p)
+        if s:
+            sessions.append(s)
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def delete_session(s):
+    s["path"].unlink(missing_ok=True)
+    folder = s["path"].with_suffix("")  # the session's subagents/tool-results
+    if folder.is_dir():
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def human_size(b):
+    for u in ("B", "K", "M", "G"):
+        if b < 1024 or u == "G":
+            return f"{b:.0f}{u}" if u == "B" else f"{b:.1f}{u}"
+        b /= 1024
+
+
+def short_cwd(cwd):
+    h = str(Path.home())
+    return "~" + cwd[len(h):] if cwd.startswith(h) else cwd
+
+
+def put(win, y, x, txt, attr=0, w=None):
+    h, W = win.getmaxyx()
+    if y < 0 or y >= h:
+        return
+    w = (W - x) if w is None else min(w, W - x)
+    if w <= 0:
+        return
+    try:
+        win.addstr(y, x, txt[:w].ljust(w) if attr else txt[:w], attr)
+    except curses.error:
+        pass
+
+
+def confirm(win, msg):
+    h, w = win.getmaxyx()
+    put(win, h - 1, 0, f" {msg} [y/N] ", curses.color_pair(3) | curses.A_BOLD, w)
+    win.refresh()
+    return win.getch() in (ord("y"), ord("Y"))
+
+
+def view(win, s):
+    msgs = read_messages(s["path"])
+    pos = 0
+    while True:
+        h, w = win.getmaxyx()
+        width = max(20, w - 2)
+        lines = []  # (text, attr)
+        for role, txt in msgs:
+            if role == "user":
+                head, attr = "▶ You", curses.color_pair(4) | curses.A_BOLD
+            else:
+                head, attr = "◀ Claude", curses.color_pair(5) | curses.A_BOLD
+            lines.append((head, attr))
+            for para in txt.split("\n"):
+                for l in textwrap.wrap(para, width, replace_whitespace=False, drop_whitespace=False) or [""]:
+                    lines.append(("  " + l, 0))
+            lines.append(("", 0))
+        body = h - 2
+        pos = max(0, min(pos, max(0, len(lines) - body)))
+        win.erase()
+        put(win, 0, 0, f" {s['title']}  —  {short_cwd(s['cwd'])}", curses.A_REVERSE, w)
+        for i in range(body):
+            if pos + i < len(lines):
+                t, a = lines[pos + i]
+                put(win, 1 + i, 0, t, a)
+        pct = 100 if len(lines) <= body else int(100 * (pos + body) / len(lines))
+        put(win, h - 1, 0, f" ↑↓/PgUp/PgDn scroll  g/G top/bottom  r restore  d delete  q back   {pct}%",
+            curses.A_REVERSE, w)
+        win.refresh()
+        k = win.getch()
+        if k in (ord("q"), 27, curses.KEY_LEFT):
+            return None
+        elif k in (curses.KEY_DOWN, ord("j")):
+            pos += 1
+        elif k in (curses.KEY_UP, ord("k")):
+            pos -= 1
+        elif k in (curses.KEY_NPAGE, ord(" ")):
+            pos += body - 1
+        elif k == curses.KEY_PPAGE:
+            pos -= body - 1
+        elif k in (ord("g"), curses.KEY_HOME):
+            pos = 0
+        elif k in (ord("G"), curses.KEY_END):
+            pos = len(lines)
+        elif k == ord("r"):
+            return "restore"
+        elif k == ord("d"):
+            if confirm(win, "Delete this conversation?"):
+                return "delete"
+
+
+def main_screen(win):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_RED)
+    curses.init_pair(4, curses.COLOR_GREEN, -1)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
+    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    sessions = list_sessions()
+    flt = ""
+    sel = top = 0
+    notice = ""
+    while True:
+        vis = [s for s in sessions
+               if flt.lower() in (s["title"] + " " + s["cwd"] + " " + s["id"]).lower()]
+        h, w = win.getmaxyx()
+        body = h - 3
+        sel = max(0, min(sel, len(vis) - 1))
+        top = min(max(top, sel - body + 1), sel) if vis else 0
+        win.erase()
+        put(win, 0, 0, f" Claude conversations v{__version__} — {len(vis)}/{len(sessions)}"
+            + (f"   filter: {flt}" if flt else ""), curses.A_REVERSE, w)
+        for i in range(body):
+            j = top + i
+            if j >= len(vis):
+                break
+            s = vis[j]
+            date = datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+            meta = f"{date}  {s['n']:>4} msg  {human_size(s['size']):>6}  "
+            proj = short_cwd(s["cwd"])
+            title_w = max(10, w - len(meta) - 2 - 28)
+            line = f" {meta}{s['title'][:title_w]:<{title_w}}  {proj[-26:]}"
+            put(win, 1 + i, 0, line, curses.color_pair(6) if j == sel else 0, w)
+        if not vis:
+            put(win, 2, 2, "No conversations found.")
+        put(win, h - 2, 0, f" {notice}", curses.color_pair(1), w)
+        put(win, h - 1, 0, " ↑↓ move  Enter view  r restore  d delete  / filter  q quit",
+            curses.A_REVERSE, w)
+        win.refresh()
+        notice = ""
+        k = win.getch()
+        if k in (ord("q"), 27):
+            if flt:
+                flt = ""
+            else:
+                return None
+        elif k in (curses.KEY_DOWN, ord("j")):
+            sel += 1
+        elif k in (curses.KEY_UP, ord("k")):
+            sel -= 1
+        elif k == curses.KEY_NPAGE:
+            sel += body
+        elif k == curses.KEY_PPAGE:
+            sel -= body
+        elif k in (curses.KEY_HOME, ord("g")):
+            sel = 0
+        elif k in (curses.KEY_END, ord("G")):
+            sel = len(vis) - 1
+        elif k == ord("/"):
+            curses.curs_set(1)
+            curses.echo()
+            put(win, h - 2, 0, " filter: ", curses.color_pair(1), w)
+            win.move(h - 2, 9)
+            try:
+                flt = win.getstr(h - 2, 9, 60).decode("utf-8", "replace")
+            except curses.error:
+                flt = ""
+            curses.noecho()
+            curses.curs_set(0)
+            sel = top = 0
+        elif vis and k in (ord("\n"), curses.KEY_ENTER, curses.KEY_RIGHT, ord("r"), ord("d")):
+            s = vis[sel]
+            action = {ord("r"): "restore", ord("d"): "delete_confirm"}.get(k)
+            if action is None:
+                action = view(win, s)
+            if action == "delete_confirm":
+                action = "delete" if confirm(win, f"Delete '{s['title'][:40]}'?") else None
+            if action == "restore":
+                return s
+            if action == "delete":
+                delete_session(s)
+                sessions.remove(s)
+                notice = "Conversation deleted."
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-V", "--version"):
+        print(f"claude-sessions {__version__}")
+        return
+    if not ROOT.is_dir():
+        sys.exit(f"Not found: {ROOT}")
+    s = curses.wrapper(main_screen)
+    if s:
+        cwd = s["cwd"] if s["cwd"] and os.path.isdir(s["cwd"]) else None
+        if cwd:
+            os.chdir(cwd)
+        print(f"Restoring {s['id']} in {os.getcwd()}")
+        os.execvp("claude", ["claude", "--resume", s["id"]])
+
+
+if __name__ == "__main__":
+    main()
