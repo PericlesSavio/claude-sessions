@@ -2,20 +2,35 @@
 """claude-sessions: terminal browser for Claude Code conversations.
 
 Lists the sessions in ~/.claude/projects, shows their content, restores
-them (claude --resume) and deletes them. Standard library only (curses).
+them (claude --resume), starts new ones and deletes them. Standard library
+only (curses); on Windows, curses comes from the windows-curses package.
 """
-import curses
 import json
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import textwrap
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.1.0"
+WINDOWS = os.name == "nt"
+
+try:
+    import curses
+except ImportError:
+    if not WINDOWS:
+        raise
+    sys.exit("Python on Windows has no curses. Install it with:\n"
+             "  python -m pip install windows-curses")
+
+__version__ = "0.2.0"
 
 ROOT = Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")) / "projects"
+
+# Enter arrives as \n or \r depending on the platform; 459 is PDCurses' PADENTER.
+ENTER_KEYS = {ord("\n"), ord("\r"), curses.KEY_ENTER} | ({459} if WINDOWS else set())
 
 
 def text_of(content):
@@ -118,7 +133,10 @@ def human_size(b):
 
 def short_cwd(cwd):
     h = str(Path.home())
-    return "~" + cwd[len(h):] if cwd.startswith(h) else cwd
+    # normcase: Windows paths are case-insensitive and may use either slash.
+    if os.path.normcase(cwd + os.sep).startswith(os.path.normcase(h + os.sep)):
+        return "~" + cwd[len(h):]
+    return cwd
 
 
 def put(win, y, x, txt, attr=0, w=None):
@@ -128,17 +146,59 @@ def put(win, y, x, txt, attr=0, w=None):
     w = (W - x) if w is None else min(w, W - x)
     if w <= 0:
         return
+    # Control characters (such as the \r of Windows line endings) break the layout.
+    txt = "".join(c if c.isprintable() else " " for c in txt)
     try:
         win.addstr(y, x, txt[:w].ljust(w) if attr else txt[:w], attr)
     except curses.error:
         pass
 
 
+def get_key(win):
+    k = win.getch()
+    if k == curses.KEY_RESIZE and WINDOWS:
+        curses.resize_term(0, 0)  # PDCurses does not pick up the new size by itself
+    return k
+
+
 def confirm(win, msg):
     h, w = win.getmaxyx()
     put(win, h - 1, 0, f" {msg} [y/N] ", curses.color_pair(3) | curses.A_BOLD, w)
     win.refresh()
-    return win.getch() in (ord("y"), ord("Y"))
+    return get_key(win) in (ord("y"), ord("Y"))
+
+
+def read_line(win, prompt, initial=""):
+    """Read text on the line above the footer. Returns None if Esc cancels it.
+
+    Uses get_wch instead of getstr so that accented characters work on Windows.
+    """
+    txt = initial
+    curses.curs_set(1)
+    try:
+        while True:
+            h, w = win.getmaxyx()
+            line = f" {prompt}{txt}"
+            put(win, h - 2, 0, line, curses.color_pair(1), w)
+            win.move(h - 2, min(len(line), w - 1))
+            win.refresh()
+            try:
+                c = win.get_wch()
+            except curses.error:
+                continue
+            if c == "\x1b":
+                return None
+            if c in ("\n", "\r") or (c in ENTER_KEYS and not isinstance(c, str)):
+                return txt
+            if c in ("\b", "\x7f", curses.KEY_BACKSPACE):
+                txt = txt[:-1]
+            elif c == curses.KEY_RESIZE:
+                if WINDOWS:
+                    curses.resize_term(0, 0)
+            elif isinstance(c, str) and c.isprintable():
+                txt += c
+    finally:
+        curses.curs_set(0)
 
 
 def view(win, s):
@@ -154,7 +214,7 @@ def view(win, s):
             else:
                 head, attr = "◀ Claude", curses.color_pair(5) | curses.A_BOLD
             lines.append((head, attr))
-            for para in txt.split("\n"):
+            for para in txt.splitlines():
                 for l in textwrap.wrap(para, width, replace_whitespace=False, drop_whitespace=False) or [""]:
                     lines.append(("  " + l, 0))
             lines.append(("", 0))
@@ -170,7 +230,7 @@ def view(win, s):
         put(win, h - 1, 0, f" ↑↓/PgUp/PgDn scroll  g/G top/bottom  r restore  d delete  q back   {pct}%",
             curses.A_REVERSE, w)
         win.refresh()
-        k = win.getch()
+        k = get_key(win)
         if k in (ord("q"), 27, curses.KEY_LEFT):
             return None
         elif k in (curses.KEY_DOWN, ord("j")):
@@ -228,11 +288,11 @@ def main_screen(win):
         if not vis:
             put(win, 2, 2, "No conversations found.")
         put(win, h - 2, 0, f" {notice}", curses.color_pair(1), w)
-        put(win, h - 1, 0, " ↑↓ move  Enter view  r restore  d delete  / filter  q quit",
+        put(win, h - 1, 0, " ↑↓ move  Enter view  n new  r restore  d delete  / filter  q quit",
             curses.A_REVERSE, w)
         win.refresh()
         notice = ""
-        k = win.getch()
+        k = get_key(win)
         if k in (ord("q"), 27):
             if flt:
                 flt = ""
@@ -251,18 +311,16 @@ def main_screen(win):
         elif k in (curses.KEY_END, ord("G")):
             sel = len(vis) - 1
         elif k == ord("/"):
-            curses.curs_set(1)
-            curses.echo()
-            put(win, h - 2, 0, " filter: ", curses.color_pair(1), w)
-            win.move(h - 2, 9)
-            try:
-                flt = win.getstr(h - 2, 9, 60).decode("utf-8", "replace")
-            except curses.error:
-                flt = ""
-            curses.noecho()
-            curses.curs_set(0)
+            flt = read_line(win, "filter: ") or ""
             sel = top = 0
-        elif vis and k in (ord("\n"), curses.KEY_ENTER, curses.KEY_RIGHT, ord("r"), ord("d")):
+        elif k == ord("n"):
+            folder = read_line(win, "new conversation in: ", os.getcwd())
+            if folder is not None:
+                folder = os.path.expanduser(folder.strip().strip('"'))
+                if os.path.isdir(folder):
+                    return {"new": True, "cwd": folder}
+                notice = f"Folder not found: {folder}"
+        elif vis and k in ENTER_KEYS | {curses.KEY_RIGHT, ord("r"), ord("d")}:
             s = vis[sel]
             action = {ord("r"): "restore", ord("d"): "delete_confirm"}.get(k)
             if action is None:
@@ -272,24 +330,48 @@ def main_screen(win):
             if action == "restore":
                 return s
             if action == "delete":
-                delete_session(s)
-                sessions.remove(s)
-                notice = "Conversation deleted."
+                try:
+                    delete_session(s)
+                except OSError as e:  # e.g. Windows: the file is open in a running session
+                    notice = f"Could not delete: {e}"
+                else:
+                    sessions.remove(s)
+                    notice = "Conversation deleted."
+
+
+def run_claude(args):
+    """Hand the terminal over to claude; does not return."""
+    if not WINDOWS:
+        os.execvp("claude", ["claude"] + args)
+    # Windows has no real exec: os.exec* returns to the shell while claude still
+    # runs, and only finds .exe files. So wait for claude and pass on its exit code.
+    exe = shutil.which("claude")
+    if not exe:
+        sys.exit("'claude' not found in PATH.")
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl+C belongs to claude
+    sys.exit(subprocess.call([exe] + args))
 
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("-V", "--version"):
         print(f"claude-sessions {__version__}")
         return
+    if WINDOWS:
+        sys.stdout.reconfigure(errors="replace")
+        if not sys.stdin.isatty():
+            sys.exit("A Windows console is required: use PowerShell, cmd or Windows Terminal "
+                     "(in Git Bash, run it through winpty).")
     if not ROOT.is_dir():
         sys.exit(f"Not found: {ROOT}")
     s = curses.wrapper(main_screen)
     if s:
-        cwd = s["cwd"] if s["cwd"] and os.path.isdir(s["cwd"]) else None
-        if cwd:
-            os.chdir(cwd)
+        if s["cwd"] and os.path.isdir(s["cwd"]):
+            os.chdir(s["cwd"])
+        if s.get("new"):
+            print(f"Starting a new conversation in {os.getcwd()}")
+            run_claude([])
         print(f"Restoring {s['id']} in {os.getcwd()}")
-        os.execvp("claude", ["claude", "--resume", s["id"]])
+        run_claude(["--resume", s["id"]])
 
 
 if __name__ == "__main__":
